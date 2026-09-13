@@ -19,7 +19,6 @@ from mutagen.wave import WAVE
 from pydantic import BaseModel
 from google.genai import types
 
-from LTXVideoManager import z_manager
 import dynamo_logger
 from dynamo_logger import STAGE_NAME
 
@@ -34,8 +33,8 @@ def startup_event():
 
 # Set your Gemini API Key here or as an environment variable
 # pasted below is API key for BhaktBhaktiAurBhajan
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBR_ISZYA_ifRCIW22MetN7jZ7w8OA90_s")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDd-7LGd9E9ED9dJpMJ1mo5kQLC8u7L8Eg")
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "DUMMY API KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "DUMMY API KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
 
@@ -808,87 +807,6 @@ async def generate_video_description(req: VideoDescReq):
         dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR", f"Exception in generate_video_description: {e}",
                                     details=traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/generate/images")
-async def generate_images(req: GenerationRequest):
-    step_name = "GENERATE_IMAGES"
-    dynamo_logger.log_abstract(STAGE_NAME, step_name, "STARTED", f"Started scene image generation")
-    OUTPUT_DIR = "./final_video_frames/devotional"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    client = googleGenAI.Client(api_key="AIzaSyCbspPWH7Hn1gyqRpIT1aR2m4OLYU5kqCE")
-
-    per_song_frames = []
-
-    if req.audio_lyrics_image_prompt is not None:
-        audio_lyrics_image = []
-        for idx, audioLyricsImgPrompt in enumerate(req.audio_lyrics_image_prompt):
-            segment_image = []
-            for cdx, seg in enumerate(audioLyricsImgPrompt.segments):
-                segment_image.append(seg.image_prompt)
-            audio_lyrics_image.append(segment_image)
-        req.prompts = audio_lyrics_image
-
-    print(f"request prompts is: {req.prompts}")
-    try:
-        for idx, prompts_per_song in enumerate(req.prompts):
-            saved_frames = []
-            song_name = req.song_names[idx].split(".")[0]
-            full_path = os.path.abspath(os.path.join(OUTPUT_DIR, song_name))
-            os.makedirs(full_path, exist_ok=True)
-            for per_song_idx, scene_description in enumerate(prompts_per_song):
-                print(f"current prompt running on index: {per_song_idx} and prompt is: {scene_description}")
-
-                full_prompt = f"{scene_description}"
-
-                response = client.models.generate_images(
-                    model="imagen-4.0-fast-generate-001",
-                    prompt=full_prompt,
-                    config=types.GenerateImagesConfig(
-                        number_of_images=1,
-                        aspect_ratio="16:9",
-                        output_mime_type="image/png"
-                    )
-                )
-
-                for img in response.generated_images:
-                    filename = f"frame_{clean_text(song_name)}_{str(idx).zfill(3)}_{str(per_song_idx).zfill(3)}.png"
-                    frame_path = os.path.abspath(os.path.join(full_path, filename))
-                    print(f"FULL PATH {frame_path}")
-                    with open(frame_path, "wb") as f:
-                        f.write(img.image.image_bytes)
-                    saved_frames.append(frame_path)
-
-            per_song_frames.append(saved_frames)
-
-        dynamo_logger.log_abstract(STAGE_NAME, step_name, "COMPLETED",
-                                   f"Image generation completed for {len(per_song_frames)} song(s)")
-        dynamo_logger.log_technical(STAGE_NAME, step_name, "INFO",
-                                    f"Image generation completed for {len(per_song_frames)} song(s)")
-        return {
-            "stage": STAGE_NAME,
-            "step": step_name,
-            "status": "success",
-            "frames": per_song_frames
-        }
-    except Exception as e:
-        dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED", f"Failed to generate images: {e}")
-        dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR", f"Exception in generate_images: {e}",
-                                    details=traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        z_manager.unload()
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    """Graceful shutdown: Clears GPU before app closes."""
-    global pipe
-    del pipe
-    cleanup()
-    print("GPU Memory Cleared. Shutdown Complete.")
-
 
 def clean_text(text):
     # remove escape sequences
