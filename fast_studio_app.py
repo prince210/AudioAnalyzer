@@ -31,17 +31,29 @@ def startup_event():
     dynamo_logger.ensure_tables_exist()
 
 
-# Set your Gemini API Key here or as an environment variable
-# pasted below is API key for BhaktBhaktiAurBhajan
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "DUMMY API KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "DUMMY API KEY")
-genai.configure(api_key=GEMINI_API_KEY)
+from typing import List, Union
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+
+def get_gemini_client():
+    """Returns googleGenAI Client using GEMINI_API_KEY environment variable."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY environment variable is not configured on the server."
+        )
+    return googleGenAI.Client(api_key=api_key)
 
 
 # --- 2. Request Schemas ---
 class StoryboardRequest(BaseModel):
-    audio_path: List[str] = []
+    audio_path: Union[List[str], str] = []
     seconds_per_image: int = 10
+
     # New Jukebox fields
     jukeBox: bool = False
     topics: List[str] = []
@@ -384,7 +396,7 @@ async def generate_seo_tags(req: TagRequest):
     dynamo_logger.log_abstract(STAGE_NAME, step_name, "STARTED",
                                f"Started generating SEO tags for topics: {req.topics}", execution_id=exec_id)
     try:
-        client = googleGenAI.Client(api_key="AIzaSyDd-7LGd9E9ED9dJpMJ1mo5kQLC8u7L8Eg")
+        client = get_gemini_client()
         topic_names = [f"{idx + 1}. {t}" for idx, t in enumerate(req.topics)]
         print("Generating Tags for topics: ", topic_names)
         response = client.models.generate_content(
@@ -657,9 +669,10 @@ async def generate_storyboard(req: StoryboardRequest):
                 "response": result_data
             }
         else:
-            for _ in req.audio_path:
+            audio_paths = [req.audio_path] if isinstance(req.audio_path, str) else req.audio_path
+            for audio_file in audio_paths:
                 try:
-                    audio = WAVE(req.audio_path)
+                    audio = WAVE(audio_file)
                     total_seconds = int(audio.info.length)
                     print(f"Total audio length in seconds: {total_seconds}")
                     num_prompts = math.ceil(total_seconds / req.seconds_per_image)
@@ -737,7 +750,7 @@ async def generate_song_names(req: SongNameGenReq):
                                f"Started generating {req.totalSongToGenerate} song name(s) for idol: {req.idol}",
                                execution_id=exec_id)
     try:
-        client = googleGenAI.Client(api_key="AIzaSyDd-7LGd9E9ED9dJpMJ1mo5kQLC8u7L8Eg")
+        client = get_gemini_client()
 
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -783,7 +796,7 @@ async def generate_video_description(req: VideoDescReq):
     dynamo_logger.log_abstract(STAGE_NAME, step_name, "STARTED",
                                f"Started video description generation for topic: {req.topic}")
     try:
-        client = googleGenAI.Client(api_key="AIzaSyDd-7LGd9E9ED9dJpMJ1mo5kQLC8u7L8Eg")
+        client = get_gemini_client()
         songs_formatted = "\n ".join([f"{idx + 1}. {t}" for idx, t in enumerate(req.song_names)])
 
         response = client.models.generate_content(
@@ -807,6 +820,10 @@ async def generate_video_description(req: VideoDescReq):
         dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR", f"Exception in generate_video_description: {e}",
                                     details=traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
 
 def clean_text(text):
     # remove escape sequences
