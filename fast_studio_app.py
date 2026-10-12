@@ -31,6 +31,26 @@ def startup_event():
     dynamo_logger.ensure_tables_exist()
 
 
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Render and pipeline orchestrator."""
+    return {
+        "status": "UP",
+        "service": "AudioAnalyzerService",
+        "stage": STAGE_NAME
+    }
+
+
+@app.get("/")
+def root():
+    """Root endpoint for status verification."""
+    return {
+        "status": "UP",
+        "service": "AudioAnalyzerService",
+        "stage": STAGE_NAME
+    }
+
+
 from typing import List, Union
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
