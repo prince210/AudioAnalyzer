@@ -73,3 +73,31 @@ curl -X POST "https://audio-analyzer-service.onrender.com/generate/song-names" \
   ]
 }
 ```
+
+---
+
+## 🎵 Music Model Prompting Strategies (`/generate/lyrics`)
+
+The `/generate/lyrics` endpoint inspects the `music_model` field using regular expressions and dynamically tailors both **lyrics structure tags** and **musical style prompts** according to model-specific prompting requirements:
+
+### 1. ACE-Step 1.5 (`ace_step_1.5` / `ace step`)
+- **Reference**: [Rikunarita ACE-Step 1.5 Prompt Guide](https://note.com/rikunarita/n/n5c9d53950b27?hl=en)
+- **Regex Match**: `r"ace[\s_-]*step"`
+- **Lyrics Structure**: Explicit Title-case bracketed sections on their own lines: `[Intro]`, `[Verse 1]`, `[Pre-Chorus]`, `[Chorus]`, `[Bridge]`, `[Outro]`.
+- **Rhythm & Pacing Strategy**: ACE-Step sings at roughly 2 to 3 words per second. Lyrics are generated with rhythmic syllabic balance and regular stanza pacing to avoid rushed vocals or dead space.
+- **Style Caption Strategy**: Comma-separated descriptive tags specifying Genre, concrete traditional and acoustic Instrumentation (e.g., bansuri flute, dholak, tabla, harmonium), BPM/tempo, and vocal timbre (e.g., devotional, powerful male lead vocal, chorus).
+
+### 2. MiniMax Music 3 (`minimax music 3` / `minimax 3`)
+- **Reference**: [MiniMax Music 3 Prompting Guide (Hugging Face / multimodalart)](https://huggingface.co/spaces/multimodalart/minimax-music3-prompting-guide)
+- **Regex Match**: `r"mini[\s_-]*max"`
+- **Lyrics Structure**: Strict lowercase structural tags: `[intro]`, `[verse]`, `[pre-chorus]`, `[chorus]`, `[bridge]`, `[outro]`.
+- **Isolation Rule (Critical)**: Every section tag is placed on its own standalone line. Lyrics are never placed on the same line as a tag, preventing MiniMax from dropping words.
+- **Style Caption Strategy**: Focused musical description containing genre, emotional arc, vocal quality, and traditional instrumentation separated by commas.
+
+### 3. YuE 2 (`yue2` / `yue`)
+- **Reference**: [YuE 2 Prompting Guide (Song Creator Pro)](https://songcreator.pro/blog/yue2-prompting-guide)
+- **Regex Match**: `r"\byue\b|\byue[\s_-]*2\b"`
+- **Lyrics Structure**: Lowercase structural tags: `[verse 1]`, `[verse 2]`, `[chorus]`, `[bridge]`, `[outro]`. Unstable `[intro]` tags are avoided, starting directly into `[verse 1]`.
+- **Double-Newline Rule (Critical)**: Every section block is strictly separated by two newline characters (`\n\n`) to prevent YuE from looping or scrambling ~30-second audio generation chunks.
+- **Style Caption Strategy**: Space-delimited open-vocabulary tags covering: `[Genre] [Instrument] [Mood] [Gender] [Timbre/Vocal Quality]` (e.g., `devotional bhajan bansuri tabla uplifting male resonant bright vocal`).
+
