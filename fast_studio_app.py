@@ -51,11 +51,93 @@ def root():
     }
 
 
-from typing import List, Union
+from typing import List, Union, Optional
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+
+def get_music_model_strategy(music_model: Optional[str]) -> dict:
+    """
+    Identifies target music AI model using regex and returns targeted prompt formatting guidelines:
+    - ace_step_1.5 / acestep: [Intro], [Verse 1], [Chorus], [Outro] with 2-3 words/sec pacing, comma-separated style tags
+    - minimax_music_3 / minimax: Isolated lowercase tags on their own line ([intro], [verse], [chorus]), no inline words on tag line
+    - yue2 / yue: Standard lowercase tags separated by double newlines (\n\n), space-delimited style tags (genre instrument mood vocal)
+    """
+    model_str = (music_model or "").strip().lower()
+
+    # 1. ACE Step 1.5 / ACE Step
+    if re.search(r"ace[\s_-]*step", model_str):
+        return {
+            "model_type": "ace_step_1.5",
+            "section_tags_style": "[Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro]",
+            "tag_case": "Title",
+            "tag_instruction": (
+                "For ACE-Step 1.5:\n"
+                "- Structure lyrics using explicit bracketed sections on their own lines: [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro].\n"
+                "- Pacing and Syllable Rule: ACE-Step vocal pacing is ~2 to 3 words per second. Keep verses rhythmically balanced (not too word-dense, not too sparse).\n"
+                "- Ensure rhyme scheme and clean stanza breaks for natural diffusion melody generation."
+            ),
+            "style_instruction": (
+                "Generate ACE-Step 1.5 Captions as comma-separated descriptive keywords: "
+                "Genre, Instrumentation (specific instruments like dholak, bansuri flute, sitar, tabla), Tempo/BPM, and Vocal description (e.g. powerful male devotional vocal, resonant chorus). "
+                "Keep it concise, comma-separated."
+            )
+        }
+
+    # 2. MiniMax Music 3 / MiniMax Music
+    elif re.search(r"mini[\s_-]*max", model_str):
+        return {
+            "model_type": "minimax_music_3",
+            "section_tags_style": "[intro], [verse], [pre-chorus], [chorus], [bridge], [outro]",
+            "tag_case": "lower",
+            "tag_instruction": (
+                "For MiniMax Music 3:\n"
+                "- CRITICAL RULE: Place EVERY section tag on its OWN DEDICATED LINE (e.g., [verse], [chorus], [bridge], [outro]).\n"
+                "- NEVER put lyrics on the same line as a tag (e.g. NEVER do '[verse] lyric line'). The lyric words must start on the next line, otherwise MiniMax drops them entirely.\n"
+                "- Use recognized lowercase structural tags: [intro], [verse], [pre-chorus], [chorus], [bridge], [outro].\n"
+                "- Ensure sufficient multi-section arrangement so MiniMax can generate a full-length, progressive musical structure."
+            ),
+            "style_instruction": (
+                "Generate MiniMax 3 Style Descriptor: 4 to 6 descriptive tags covering genre, emotional timbre, vocal clarity, and traditional acoustic instrumentation separated by commas."
+            )
+        }
+
+    # 3. YuE 2 / YuE
+    elif re.search(r"\byue\b|\byue[\s_-]*2\b", model_str):
+        return {
+            "model_type": "yue2",
+            "section_tags_style": "[verse], [chorus], [bridge], [outro]",
+            "tag_case": "lower",
+            "tag_instruction": (
+                "For YuE 2:\n"
+                "- Use lowercase bracketed structure tags on their own line: [verse 1], [chorus], [verse 2], [bridge], [outro].\n"
+                "- SEPARATION RULE: Separate every section block from each other with exactly TWO NEWLINE CHARACTERS (blank line between sections).\n"
+                "- Keep lyric lines natural and avoid over-cramming words into a single segment (~30 sec chunks).\n"
+                "- Avoid unstable [intro] tags; start directly with [verse 1] or [verse]."
+            ),
+            "style_instruction": (
+                "Generate YuE 2 Open-Vocabulary Style Tags separated by spaces (SPACE-DELIMITED): "
+                "[Genre] [Instrument] [Mood] [Gender] [Timbre/Vocal Quality] (e.g. 'devotional bhajan bansuri tabla uplifting male resonant bright vocal')."
+            )
+        }
+
+    # 4. Default / Generic fallback
+    else:
+        return {
+            "model_type": "default",
+            "section_tags_style": "[Verse], [Chorus], [Bridge], [Outro]",
+            "tag_case": "Title",
+            "tag_instruction": (
+                "Structure lyrics clearly with bracketed section tags on their own lines: [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro]. "
+                "Maintain steady rhythm, devotional depth, emotional hooks, and structured rhyme."
+            ),
+            "style_instruction": (
+                "Generate artistic musical styles in 4 to 5 words separated by commas to enhance the song hearing experience based on Indian devotional bhajan style."
+            )
+        }
+
 
 
 def get_gemini_client():
@@ -128,6 +210,10 @@ class LyricsRequest(BaseModel):
     language: str = "Hindi"
     commasepgenre: str
     existingLyrics: bool = False
+    music_model: Optional[str] = None
+    music_model_id: Optional[str] = None
+    video_model: Optional[str] = None
+    video_model_id: Optional[str] = None
 
 
 class LyricsBatchRequest(BaseModel):
@@ -471,18 +557,25 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
             chunk = request.requests[i:i + chunk_size]
 
             for req in chunk:
+                # Resolve model-specific prompting strategy
+                strategy = get_music_model_strategy(req.music_model)
+                print(f"Using music model strategy: {strategy['model_type']} for topic: {req.topic}")
+
                 if req.existingLyrics:
                     print(f"Getting existing lyrics")
                     prompt = (f"""
-                                1. Fetch original LYRICS for the devotional song about: '{req.topic}' in '{req.language} language' only. Do NOT generate a summary or a new lyrics, generated lyrics should exactly match existing lyrics. Only output the original, non empty LYRICS from non copyright source."
-                                2. Based on LYRICS obtained in step 1. Generate {req.commasepgenre} STYLE for songs in 4 to 5 words separated by comma to enhance the song hearing experience based on indian culture bhajan style.
+                                1. Fetch original LYRICS for the devotional song about: '{req.topic}' in '{req.language} language' only. Do NOT generate a summary or a new lyrics, generated lyrics should exactly match existing lyrics. Only output the original, non empty LYRICS from non copyright source.
+                                2. Format the lyrics sections matching this style: {strategy['section_tags_style']}.
+                                3. Based on LYRICS obtained in step 1, generate musical STYLE/caption for the song following these guidelines:
+                                {strategy['style_instruction']}
                               """)
                     tags = "[LYRICS]...[STYLE]"
                     system_instruction = (
                         f"""
-                            1. You are a professional hit-making songwriter. Get LYRICS structured with #Verse#, #Chorus#, and #Bridge#. Do not provide anything else than lyrics."
-                            2. LYRICS should not be empty.
-                            3. OUTPUT FORMAT:
+                            1. You are a professional songwriter and music AI director.
+                            2. {strategy['tag_instruction']}
+                            3. LYRICS should not be empty.
+                            4. OUTPUT FORMAT:
                             You must use these exact markers. Do not include any other text.
                             {tags}
                         """)
@@ -516,14 +609,16 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                                 "topic": req.topic,
                                 "language": req.language,
                                 "lyrics": result["lyrics"],
-                                "style": result["style"]
+                                "style": result["style"],
+                                "music_model": req.music_model,
+                                "video_model": req.video_model
                             }
                         )
 
                     except Exception as e:
                         dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR",
-                                                    f"Error fetching existing lyrics for topic '{req.topic}': {e}",
-                                                    details=traceback.format_exc())
+                                                     f"Error fetching existing lyrics for topic '{req.topic}': {e}",
+                                                     details=traceback.format_exc())
                         fail_log = dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED",
                                                               f"Error fetching existing lyrics: {e}",
                                                               execution_id=exec_id)
@@ -558,8 +653,8 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
 
                     except Exception as e:
                         dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR",
-                                                    f"Error generating summary for topic '{req.topic}': {e}",
-                                                    details=traceback.format_exc())
+                                                     f"Error generating summary for topic '{req.topic}': {e}",
+                                                     details=traceback.format_exc())
                         fail_log = dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED",
                                                               f"Error generating summary: {e}", execution_id=exec_id)
                         step_info = {
@@ -575,44 +670,58 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                         return {"stage": STAGE_NAME, "step": step_name, "status": "error", "message": str(e),
                                 "steps": [step_info]}
 
-                    print(f"Generating a minimum 2-minute {req.language} song about {req.topic}...")
+                    print(f"Generating a minimum 2-minute {req.language} song about {req.topic} for model {strategy['model_type']}...")
                     system_instruction = (
                         f"""
-                        You are a professional hit-making songwriter. Write lyrics that are devotional, emotional, catchy, and structured with [Verse], [Chorus], and [Bridge]. Ensure consistent structured rhyme"
+                        You are a professional hit-making songwriter and AI music prompting specialist.
+                        Write lyrics that are devotional, emotional, catchy, with goosebump-inducing phrasing.
+                        {strategy['tag_instruction']}
+                        Ensure consistent structured rhyme and natural musicality.
                         """)
                     prompt = (
                         f"""
-                            Analyze the provided summary {summary} and write a song in {req.language} language 
-                            relying heavily on mixture of complex and simple {req.language} words that follow Rhythm and rhyme glorifying the deity in devotional 
-                            way giving goosebumps. Structure song with [Verse], [Chorus], and [Bridge]. Only return the lyrics.
+                            Analyze the provided summary:
+                            {summary}
+
+                            Write a complete, structured song in {req.language} language relying heavily on a rich mixture of devotional words that follow rhythm and rhyme glorifying the deity.
+                            Target Section Layout: {strategy['section_tags_style']}.
+                            Strict formatting requirement:
+                            {strategy['tag_instruction']}
+                            Only return the lyrics with section markers. Do not include introductory or concluding conversational prose.
                         """
                     )
 
                     try:
                         lyrics = call_gemini(prompt, system_instruction)
                         print(f"LYRICS \n {lyrics}")
-                        prompt = f"Provided the devotional hindi lyrics as {lyrics}. Do NOT generate a summary or a new song. Only output the style in which it should be sung for better hearing experience."
-                        system_instruction = (
-                            f"""
-                                You are a professional hit-making songwriter. Generate artistic styles in 3 to 4 words comma separated to enhance the song hearing experience."
-                            """)
 
-                        styles_generated = call_gemini(prompt, system_instruction)
+                        prompt_style = (
+                            f"Given the devotional {req.language} lyrics below:\n{lyrics}\n\n"
+                            f"Generate the musical style/caption for AI music generation based on the following instruction:\n"
+                            f"{strategy['style_instruction']}\n"
+                            f"Base it on traditional Indian devotional and modern spiritual soundscapes. Output only the style string."
+                        )
+                        system_instruction_style = (
+                            "You are a music AI prompt engineering expert. Output only the requested style string without commentary."
+                        )
 
-                        print(f"Styles generated {styles_generated}")
+                        styles_generated = call_gemini(prompt_style, system_instruction_style)
+                        print(f"Styles generated: {styles_generated}")
 
                         results.append({
                             "status": "success",
                             "topic": req.topic,
                             "language": req.language,
                             "lyrics": lyrics,
-                            "style": styles_generated
+                            "style": styles_generated,
+                            "music_model": req.music_model,
+                            "video_model": req.video_model
                         })
 
                     except Exception as e:
                         dynamo_logger.log_technical(STAGE_NAME, step_name, "ERROR",
-                                                    f"Error generating lyrics for topic '{req.topic}': {e}",
-                                                    details=traceback.format_exc())
+                                                     f"Error generating lyrics for topic '{req.topic}': {e}",
+                                                     details=traceback.format_exc())
                         fail_log = dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED",
                                                               f"Error generating lyrics: {e}", execution_id=exec_id)
                         step_info = {
