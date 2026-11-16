@@ -6,9 +6,10 @@ import math
 import os
 import random
 import re
+import time
 import traceback
 import uuid
-from typing import List
+from typing import List, Union, Optional, Tuple, Dict, Any
 
 import google.generativeai as genai
 import torch
@@ -232,14 +233,146 @@ class ThumbnailRequest(BaseModel):
     execution_id: str = None
 
 
-# --- Helper: Gemini Call ---
-def call_gemini(prompt: str, system_instruction: str = ""):
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=system_instruction
+# --- Helper: Cost Calculation for Gemini ---
+# Base rates can be overridden dynamically via environment variables without code redeployment:
+# GEMINI_INPUT_RATE_PER_1M and GEMINI_OUTPUT_RATE_PER_1M
+DEFAULT_INPUT_RATE_PER_1M = 0.30   # $0.30 per 1M input tokens (gemini-2.5-flash)
+DEFAULT_OUTPUT_RATE_PER_1M = 2.50  # $2.50 per 1M output tokens (gemini-2.5-flash)
+
+
+def get_model_pricing_rates(model: str = "gemini-2.5-flash") -> Tuple[float, float, str]:
+    """
+    Returns (input_rate_per_1m, output_rate_per_1m, source).
+    Supports dynamic runtime environment variable overrides:
+    - GEMINI_INPUT_RATE_PER_1M
+    - GEMINI_OUTPUT_RATE_PER_1M
+    Falls back to official model tier pricing table.
+    """
+    env_in = os.getenv("GEMINI_INPUT_RATE_PER_1M")
+    env_out = os.getenv("GEMINI_OUTPUT_RATE_PER_1M")
+    if env_in and env_out:
+        try:
+            return float(env_in), float(env_out), "env_override"
+        except ValueError:
+            pass
+
+    # Model family pricing table
+    m = (model or "").lower()
+    if "flash-lite" in m:
+        return 0.10, 0.40, "model_tier_pricing"
+    elif "2.5-flash" in m or "2.0-flash" in m or "flash" in m:
+        return DEFAULT_INPUT_RATE_PER_1M, DEFAULT_OUTPUT_RATE_PER_1M, "model_tier_pricing"
+    elif "pro" in m:
+        return 1.25, 5.00, "model_tier_pricing"
+    return DEFAULT_INPUT_RATE_PER_1M, DEFAULT_OUTPUT_RATE_PER_1M, "default_tier_pricing"
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimates token count from text using 4 chars per token rule of thumb."""
+    if not text:
+        return 0
+    return max(1, int(math.ceil(len(text) / 4.0)))
+
+
+def build_cost_details(
+    prompt_tokens: int,
+    candidate_tokens: int,
+    execution_time_seconds: float,
+    model: str = "gemini-2.5-flash"
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Computes exact cost_usd and structured cost_details for Gemini LLM requests.
+    Supports dynamic pricing overrides and transparent breakdown.
+    """
+    input_rate, output_rate, pricing_source = get_model_pricing_rates(model)
+    input_cost = (prompt_tokens / 1_000_000.0) * input_rate
+    output_cost = (candidate_tokens / 1_000_000.0) * output_rate
+    cost_usd = round(input_cost + output_cost, 6)
+
+    execution_time_ms = int(round(execution_time_seconds * 1000))
+    exec_sec_display = round(execution_time_seconds, 2)
+    dollar = chr(36)
+    formula = (
+        f"({prompt_tokens} input * {dollar}{input_rate:.2f}/1M) + "
+        f"({candidate_tokens} output * {dollar}{output_rate:.2f}/1M) = "
+        f"{dollar}{cost_usd:.6f}"
     )
-    response = model.generate_content(prompt)
-    return response.text
+
+    details = {
+        "cost_usd": cost_usd,
+        "model": model,
+        "pricing_source": pricing_source,
+        "prompt_tokens": prompt_tokens,
+        "candidate_tokens": candidate_tokens,
+        "total_tokens": prompt_tokens + candidate_tokens,
+        "input_rate_per_1m_usd": input_rate,
+        "output_rate_per_1m_usd": output_rate,
+        "execution_time_ms": execution_time_ms,
+        "execution_time_seconds": exec_sec_display,
+        "calculation_formula": formula
+    }
+    return cost_usd, details
+
+
+# --- Helper: Gemini Call with Cost Tracking ---
+def call_gemini(prompt: str, system_instruction: str = "") -> str:
+    """Legacy helper returning generated text."""
+    text, _, _ = call_gemini_with_cost(prompt, system_instruction)
+    return text
+
+
+def call_gemini_with_cost(prompt: str, system_instruction: str = "") -> Tuple[str, float, Dict[str, Any]]:
+    """
+    Executes a Gemini call, extracting token usage and computing costs and timing.
+    Returns (response_text, cost_usd, cost_details).
+    """
+    start_time = time.time()
+    prompt_tokens = 0
+    candidate_tokens = 0
+    response_text = ""
+
+    # Prefer modern google-genai client if configured
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        try:
+            client = googleGenAI.Client(api_key=api_key)
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction
+            ) if system_instruction else None
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=config
+            )
+            response_text = response.text or ""
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        except Exception as e:
+            print(f"[call_gemini_with_cost] googleGenAI failed, trying fallback: {e}")
+
+    # Fallback to legacy google.generativeai if text is still empty
+    if not response_text:
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=system_instruction
+        )
+        response = model.generate_content(prompt)
+        response_text = response.text or ""
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+
+    elapsed = time.time() - start_time
+    if prompt_tokens == 0:
+        full_input = (system_instruction + "\n" + prompt) if system_instruction else prompt
+        prompt_tokens = estimate_tokens(full_input)
+    if candidate_tokens == 0:
+        candidate_tokens = estimate_tokens(response_text)
+
+    cost_usd, cost_details = build_cost_details(prompt_tokens, candidate_tokens, elapsed)
+    return response_text, cost_usd, cost_details
+
 
 
 def cleanup():
@@ -464,9 +597,8 @@ async def generate_thumbnail_prompt(request: ThumbnailRequest):
     """
 
     try:
-        response = call_gemini(prompt, system_instr)
-        prompt_text = response.strip() if isinstance(response, str) else (
-            response.text.strip() if hasattr(response, 'text') else str(response).strip())
+        response_text, cost_usd, cost_details = call_gemini_with_cost(prompt, system_instr)
+        prompt_text = response_text.strip()
         comp_log = dynamo_logger.log_abstract(STAGE_NAME, step_name, "COMPLETED",
                                               "Thumbnail prompt generated successfully", execution_id=exec_id)
         dynamo_logger.log_technical(STAGE_NAME, step_name, "INFO", "Thumbnail prompt generated successfully")
@@ -478,6 +610,8 @@ async def generate_thumbnail_prompt(request: ThumbnailRequest):
             "status": "COMPLETED",
             "message": "Thumbnail prompt generated successfully",
             "execution_id": exec_id,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "timestamp": comp_log.get("timestamp") if comp_log else datetime.datetime.utcnow().isoformat() + "Z"
         }
 
@@ -485,6 +619,8 @@ async def generate_thumbnail_prompt(request: ThumbnailRequest):
             "stage": STAGE_NAME,
             "step": step_name,
             "prompt": prompt_text,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "steps": [step_info]
         }
     except Exception as e:
@@ -505,11 +641,30 @@ async def generate_seo_tags(req: TagRequest):
         client = get_gemini_client()
         topic_names = [f"{idx + 1}. {t}" for idx, t in enumerate(req.topics)]
         print("Generating Tags for topics: ", topic_names)
+        content_prompt = (
+            f"You are an SEO expert for YouTube. Read these song names: {topic_names} and output a comma-separated "
+            "list of 15 highly searched, relevant YouTube tags. No other text."
+        )
+
+        start_time = time.time()
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"You are an SEO expert for YouTube. Read these song names: {topic_names} and output a comma-separated "
-                     "list of 15 highly searched, relevant YouTube tags. No other text."
+            contents=content_prompt
         )
+        elapsed = time.time() - start_time
+
+        prompt_tokens = 0
+        candidate_tokens = 0
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        if prompt_tokens == 0:
+            prompt_tokens = estimate_tokens(content_prompt)
+        if candidate_tokens == 0:
+            candidate_tokens = estimate_tokens(response.text or "")
+
+        cost_usd, cost_details = build_cost_details(prompt_tokens, candidate_tokens, elapsed)
+
         processed_list = [item.strip() for item in response.text.split(',')]
         print("Generating Tags for topics: ", topic_names)
         print("Generating Tags Response retrieved : ", processed_list)
@@ -525,6 +680,8 @@ async def generate_seo_tags(req: TagRequest):
             "status": "COMPLETED",
             "message": f"Generated {len(processed_list)} SEO tags successfully",
             "execution_id": exec_id,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "timestamp": comp_log.get("timestamp") if comp_log else datetime.datetime.utcnow().isoformat() + "Z"
         }
 
@@ -532,6 +689,8 @@ async def generate_seo_tags(req: TagRequest):
             "stage": STAGE_NAME,
             "step": step_name,
             "tags": processed_list,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "steps": [step_info]
         }
     except Exception as e:
@@ -552,6 +711,11 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                                execution_id=exec_id)
     try:
         results = []
+        batch_total_cost = 0.0
+        batch_prompt_tokens = 0
+        batch_candidate_tokens = 0
+        batch_start_time = time.time()
+
         chunk_size = 5
         for i in range(0, len(request.requests), chunk_size):
             chunk = request.requests[i:i + chunk_size]
@@ -581,7 +745,8 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                         """)
 
                     try:
-                        lyrics_styles = call_gemini(prompt, system_instruction) + "["
+                        raw_lyrics_styles, item_cost, item_cost_details = call_gemini_with_cost(prompt, system_instruction)
+                        lyrics_styles = raw_lyrics_styles + "["
                         patterns = {
                             "summary": r"\[SUMMARY\](.*?)\[",
                             "lyrics": r"\[LYRICS\](.*?)\[",
@@ -603,6 +768,10 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                         if len(splitted_lyrics) < 5:
                             result["lyrics"] = (result["lyrics"] + ".") * 11
 
+                        batch_total_cost += item_cost
+                        batch_prompt_tokens += item_cost_details.get("prompt_tokens", 0)
+                        batch_candidate_tokens += item_cost_details.get("candidate_tokens", 0)
+
                         results.append(
                             {
                                 "status": "success",
@@ -611,7 +780,9 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                                 "lyrics": result["lyrics"],
                                 "style": result["style"],
                                 "music_model": req.music_model,
-                                "video_model": req.video_model
+                                "video_model": req.video_model,
+                                "cost_usd": item_cost,
+                                "cost_details": item_cost_details
                             }
                         )
 
@@ -648,7 +819,7 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                                           "emotional, catchy, goosebumps.")
 
                     try:
-                        summary = call_gemini(system_prompt, system_instruction)
+                        summary, cost_sum, details_sum = call_gemini_with_cost(system_prompt, system_instruction)
                         print(f"summary generated {summary}")
 
                     except Exception as e:
@@ -692,7 +863,7 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                     )
 
                     try:
-                        lyrics = call_gemini(prompt, system_instruction)
+                        lyrics, cost_lyr, details_lyr = call_gemini_with_cost(prompt, system_instruction)
                         print(f"LYRICS \n {lyrics}")
 
                         prompt_style = (
@@ -705,8 +876,18 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                             "You are a music AI prompt engineering expert. Output only the requested style string without commentary."
                         )
 
-                        styles_generated = call_gemini(prompt_style, system_instruction_style)
+                        styles_generated, cost_sty, details_sty = call_gemini_with_cost(prompt_style, system_instruction_style)
                         print(f"Styles generated: {styles_generated}")
+
+                        item_total_tokens = details_sum.get("total_tokens", 0) + details_lyr.get("total_tokens", 0) + details_sty.get("total_tokens", 0)
+                        item_prompt_tokens = details_sum.get("prompt_tokens", 0) + details_lyr.get("prompt_tokens", 0) + details_sty.get("prompt_tokens", 0)
+                        item_candidate_tokens = details_sum.get("candidate_tokens", 0) + details_lyr.get("candidate_tokens", 0) + details_sty.get("candidate_tokens", 0)
+                        item_exec_seconds = details_sum.get("execution_time_seconds", 0.0) + details_lyr.get("execution_time_seconds", 0.0) + details_sty.get("execution_time_seconds", 0.0)
+                        item_total_cost, item_cost_details = build_cost_details(item_prompt_tokens, item_candidate_tokens, item_exec_seconds)
+
+                        batch_total_cost += item_total_cost
+                        batch_prompt_tokens += item_prompt_tokens
+                        batch_candidate_tokens += item_candidate_tokens
 
                         results.append({
                             "status": "success",
@@ -715,7 +896,9 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                             "lyrics": lyrics,
                             "style": styles_generated,
                             "music_model": req.music_model,
-                            "video_model": req.video_model
+                            "video_model": req.video_model,
+                            "cost_usd": item_total_cost,
+                            "cost_details": item_cost_details
                         })
 
                     except Exception as e:
@@ -741,6 +924,9 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
                 print(f"⏳ Reached API limit (4 requests). Waiting 60 seconds before continuing...")
                 await asyncio.sleep(60)
 
+        batch_elapsed = time.time() - batch_start_time
+        batch_final_cost, batch_cost_details = build_cost_details(batch_prompt_tokens, batch_candidate_tokens, batch_elapsed)
+
         comp_log = dynamo_logger.log_abstract(STAGE_NAME, step_name, "COMPLETED",
                                               f"Completed batch lyrics generation for {len(results)} request(s)",
                                               execution_id=exec_id)
@@ -754,6 +940,8 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
             "status": "COMPLETED",
             "message": f"Completed batch lyrics generation for {len(results)} request(s)",
             "execution_id": exec_id,
+            "cost_usd": batch_final_cost,
+            "cost_details": batch_cost_details,
             "timestamp": comp_log.get("timestamp") if comp_log else datetime.datetime.utcnow().isoformat() + "Z"
         }
 
@@ -763,6 +951,8 @@ async def generate_lyrics_with_gemini(request: LyricsBatchRequest):
             "status": "completed",
             "total_processed": len(results),
             "data": results,
+            "cost_usd": batch_final_cost,
+            "cost_details": batch_cost_details,
             "steps": [step_info]
         }
     except Exception as e:
@@ -799,6 +989,10 @@ async def generate_storyboard(req: StoryboardRequest):
             }
         else:
             audio_paths = [req.audio_path] if isinstance(req.audio_path, str) else req.audio_path
+            storyboard_prompt_tokens = 0
+            storyboard_candidate_tokens = 0
+            storyboard_start_time = time.time()
+
             for audio_file in audio_paths:
                 try:
                     audio = WAVE(audio_file)
@@ -813,10 +1007,12 @@ async def generate_storyboard(req: StoryboardRequest):
                 summary_prompt = f"""
                 Write 6 simple, plain-English summaries about the topic: '{req.topics}'.
                 """
-                summaries = call_gemini(summary_prompt
-                                        ,
-                                        f"Focus on devotion, physical rituals, temples, and human emotions. DO NOT use complex "
-                                        f"cosmic or abstract words.")
+                summaries, cost_s, det_s = call_gemini_with_cost(
+                    summary_prompt,
+                    "Focus on devotion, physical rituals, temples, and human emotions. DO NOT use complex cosmic or abstract words."
+                )
+                storyboard_prompt_tokens += det_s.get("prompt_tokens", 0)
+                storyboard_candidate_tokens += det_s.get("candidate_tokens", 0)
 
                 prompt = f"""
                 You are a literal visual scene director. Based on these summaries:\n{summaries}\n
@@ -833,17 +1029,18 @@ async def generate_storyboard(req: StoryboardRequest):
                 6. Output ONLY a valid JSON list of {num_prompts} strings.
                 """
 
-                gemini_resp = call_gemini(prompt, prompt_system_instr)
-                raw_content = gemini_resp.strip() if isinstance(gemini_resp, str) else (
-                    gemini_resp.text.strip() if hasattr(gemini_resp, 'text') else str(gemini_resp).strip())
+                gemini_resp, cost_p, det_p = call_gemini_with_cost(prompt, prompt_system_instr)
+                storyboard_prompt_tokens += det_p.get("prompt_tokens", 0)
+                storyboard_candidate_tokens += det_p.get("candidate_tokens", 0)
 
-                clean_text = re.sub(r'```json|```', '', raw_content).strip()
+                raw_content = gemini_resp.strip()
+                clean_text_resp = re.sub(r'```json|```', '', raw_content).strip()
                 parsed_prompts = []
                 try:
-                    parsed_prompts = json.loads(clean_text)
+                    parsed_prompts = json.loads(clean_text_resp)
                 except json.JSONDecodeError:
                     print("Falling back to Regex parser for storyboard...")
-                    matches = re.findall(r'"([^"]*)"', clean_text)
+                    matches = re.findall(r'"([^"]*)"', clean_text_resp)
                     if matches:
                         parsed_prompts = matches
                     else:
@@ -856,13 +1053,23 @@ async def generate_storyboard(req: StoryboardRequest):
                     "prompts": parsed_prompts,
                     "summaries_gen": summaries
                 })
+
+            storyboard_elapsed = time.time() - storyboard_start_time
+            storyboard_cost, storyboard_cost_details = build_cost_details(
+                storyboard_prompt_tokens,
+                storyboard_candidate_tokens,
+                storyboard_elapsed
+            )
+
             dynamo_logger.log_abstract(STAGE_NAME, step_name, "COMPLETED", "Storyboard prompts generated successfully")
             dynamo_logger.log_technical(STAGE_NAME, step_name, "INFO", "Storyboard prompts generated successfully")
             return {
                 "stage": STAGE_NAME,
                 "step": step_name,
                 "status": "completed",
-                "response": response
+                "response": response,
+                "cost_usd": storyboard_cost,
+                "cost_details": storyboard_cost_details
             }
     except Exception as e:
         dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED", f"Failed to generate storyboard: {e}")
@@ -880,13 +1087,30 @@ async def generate_song_names(req: SongNameGenReq):
                                execution_id=exec_id)
     try:
         client = get_gemini_client()
+        content_prompt = (
+            f"generate top {req.totalSongToGenerate} popular non copyright"
+            f" hindi song name based on {req.idol}. "
+            f"CRITICAL : Return only comma separated song names no other text"
+        )
 
+        start_time = time.time()
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"generate top {req.totalSongToGenerate} popular non copyright"
-                     f" hindi song name based on {req.idol}. "
-                     f"CRITICAL : Return only comma separated song names no other text",
+            contents=content_prompt
         )
+        elapsed = time.time() - start_time
+
+        prompt_tokens = 0
+        candidate_tokens = 0
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        if prompt_tokens == 0:
+            prompt_tokens = estimate_tokens(content_prompt)
+        if candidate_tokens == 0:
+            candidate_tokens = estimate_tokens(response.text or "")
+
+        cost_usd, cost_details = build_cost_details(prompt_tokens, candidate_tokens, elapsed)
 
         processed_list = [item.strip() for item in response.text.split(',')]
         print(processed_list)
@@ -902,6 +1126,8 @@ async def generate_song_names(req: SongNameGenReq):
             "status": "COMPLETED",
             "message": f"Generated {len(processed_list)} song name(s) successfully",
             "execution_id": exec_id,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "timestamp": comp_log.get("timestamp") if comp_log else datetime.datetime.utcnow().isoformat() + "Z"
         }
 
@@ -909,6 +1135,8 @@ async def generate_song_names(req: SongNameGenReq):
             "stage": STAGE_NAME,
             "step": step_name,
             "song_names": processed_list,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details,
             "steps": [step_info]
         }
     except Exception as e:
@@ -927,13 +1155,30 @@ async def generate_video_description(req: VideoDescReq):
     try:
         client = get_gemini_client()
         songs_formatted = "\n ".join([f"{idx + 1}. {t}" for idx, t in enumerate(req.song_names)])
+        content_prompt = (
+            f"generate seo optimized description for youtube video for {req.topic} topic containing following "
+            f"songs {songs_formatted} in mostly hindi language and use little bit english also."
+            f"CRITICAL : Return only seo optimized description."
+        )
 
+        start_time = time.time()
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"generate seo optimized description for youtube video for {req.topic} topic containing following "
-                     f"songs {songs_formatted} in mostly hindi language and use little bit english also."
-                     f"CRITICAL : Return only seo optimized description.",
+            contents=content_prompt
         )
+        elapsed = time.time() - start_time
+
+        prompt_tokens = 0
+        candidate_tokens = 0
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            candidate_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        if prompt_tokens == 0:
+            prompt_tokens = estimate_tokens(content_prompt)
+        if candidate_tokens == 0:
+            candidate_tokens = estimate_tokens(response.text or "")
+
+        cost_usd, cost_details = build_cost_details(prompt_tokens, candidate_tokens, elapsed)
 
         response_txt = response.text
         print(response_txt)
@@ -942,7 +1187,9 @@ async def generate_video_description(req: VideoDescReq):
         return {
             "stage": STAGE_NAME,
             "step": step_name,
-            "video_description": response_txt
+            "video_description": response_txt,
+            "cost_usd": cost_usd,
+            "cost_details": cost_details
         }
     except Exception as e:
         dynamo_logger.log_abstract(STAGE_NAME, step_name, "FAILED", f"Failed to generate video description: {e}")
